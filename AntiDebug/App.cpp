@@ -748,7 +748,10 @@ DWORD WINAPI DetectionThreadProc(LPVOID /*lpParameter*/)
 }
 
 _Use_decl_annotations_
-int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdLine, int nCmdShow)
+int APIENTRY wWinMain(HINSTANCE hInstance,
+    HINSTANCE hPrevInstance,
+    PWSTR lpCmdLine,
+    int nShowCmd)
 {
     g_hInstance = hInstance;
 
@@ -808,7 +811,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdL
         return 1;
     }
 
-    ::ShowWindow(hwnd, nCmdShow);
+    ::ShowWindow(hwnd, nShowCmd);
     ::UpdateWindow(hwnd);
 
     MSG msg = {};
