@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="AntiDebug/AntiDebug.vcxproj" Id="b56ce046-4c4e-4624-a80c-4aeb334501da" />
+</Solution>
