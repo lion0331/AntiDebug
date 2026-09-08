@@ -959,33 +959,157 @@ DetectionStatus DetectDrxVEH(DWORD* lastError)
     return g_vehDrDetected ? AD_DETECTED : AD_NOT_DETECTED;
 }
 
+static const char* const kNtdllHookTargets[] = {
+    "NtQueryInformationProcess",
+    "NtSetInformationThread",
+    "NtQueryObject",
+    "NtClose",
+    "NtDuplicateObject",
+    "NtQuerySystemInformation",
+    "NtSetInformationProcess",
+    "NtOpenFile",
+    "NtCreateSection",
+    "NtMapViewOfSection",
+    "NtYieldExecution",
+    "NtGetContextThread",
+    "NtSetContextThread",
+    "NtContinue",
+    "NtCreateThreadEx",
+    "NtQuerySystemTime",
+    "NtQueryPerformanceCounter",
+    "KiUserExceptionDispatcher",
+};
+
+static bool SafeReadBytes(const void* addr, void* buf, SIZE_T size)
+{
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (::VirtualQuery(addr, &mbi, sizeof(mbi)) == 0) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    const BYTE* start = static_cast<const BYTE*>(addr);
+    const BYTE* regionEnd = static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+    if (start + size > regionEnd) return false;
+    memcpy(buf, addr, size);
+    return true;
+}
+
+static BYTE* CurrentPeb()
+{
+#ifdef _WIN64
+    return reinterpret_cast<BYTE*>(__readgsqword(0x60));
+#else
+    return reinterpret_cast<BYTE*>(__readfsdword(0x30));
+#endif
+}
+
+static bool IsPrivateExec(const void* addr)
+{
+    if (addr == nullptr) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (::VirtualQuery(addr, &mbi, sizeof(mbi)) == 0) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.Type == MEM_IMAGE) return false;
+    const DWORD exec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    return (mbi.Protect & exec) != 0;
+}
+
+static bool IsScyllaJumper(const BYTE* p, const BYTE* va, SIZE_T n)
+{
+#ifdef _WIN64
+    // ScyllaHide x64: nop; jmp qword ptr [rip+0]; <abs64>
+    if (n >= 15 &&
+        p[0] == 0x90 && p[1] == 0xFF && p[2] == 0x25 &&
+        *reinterpret_cast<const DWORD*>(p + 3) == 0)
+    {
+        return true;
+    }
+    // 无 nop 的同款绝对跳，目标落在匿名可执行页
+    if (n >= 14 && p[0] == 0xFF && p[1] == 0x25 &&
+        *reinterpret_cast<const DWORD*>(p + 2) == 0)
+    {
+        void* target = *reinterpret_cast<void* const*>(p + 6);
+        return IsPrivateExec(target);
+    }
+#else
+    if (n >= 5 && p[0] == 0xE9)
+    {
+        const INT32 rel = *reinterpret_cast<const INT32*>(p + 1);
+        void* target = reinterpret_cast<void*>(
+            reinterpret_cast<ULONG_PTR>(va) + 5 + rel);
+        return IsPrivateExec(target);
+    }
+#endif
+    return false;
+}
+
+static bool DetectWow64TransitionHook()
+{
+#ifdef _WIN64
+    return false;
+#else
+    HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+    if (ntdll == nullptr) return false;
+    FARPROC pExport = ::GetProcAddress(ntdll, "Wow64Transition");
+    if (pExport == nullptr) return false;
+
+    void* gate = nullptr;
+    if (!SafeReadBytes(pExport, &gate, sizeof(gate)) || gate == nullptr) return false;
+
+    BYTE farJmp[7]{};
+    if (!SafeReadBytes(gate, farJmp, sizeof(farJmp))) return false;
+    if (farJmp[0] != 0xEA) return false;
+
+    const USHORT selector = *reinterpret_cast<USHORT*>(farJmp + 5);
+    const ULONG dest = *reinterpret_cast<ULONG*>(farJmp + 1);
+    // 正常 wow64cpu 用 0x33；ScyllaHide 改成 0x23 跳到匿名 HookedNativeCallInternal
+    if (selector == 0x23 && IsPrivateExec(reinterpret_cast<void*>(static_cast<ULONG_PTR>(dest))))
+        return true;
+    return IsPrivateExec(reinterpret_cast<void*>(static_cast<ULONG_PTR>(dest)));
+#endif
+}
+
 DetectionStatus DetectScyllaHide(DWORD* lastError)
 {
-    if (lastError != nullptr)
+    if (lastError != nullptr) *lastError = 0;
+
+    BYTE* peb = CurrentPeb();
+    if (peb == nullptr)
     {
-        *lastError = 0;
+        if (lastError != nullptr) *lastError = ERROR_INVALID_ADDRESS;
+        return AD_NOT_DETECTED;
     }
 
-    static const wchar_t* const modules[] =
-    {
-        L"ScyllaHideX64.dll",
-        L"ScyllaHideX86.dll",
-        L"ScyllaHide.dll",
-        L"HookLibraryx64.dll",
-        L"HookLibraryx86.dll",
-        L"HookLibrary.dll"
-    };
+#ifdef _WIN64
+    const USHORT pebBuild = *reinterpret_cast<USHORT*>(peb + 0x120);
+#else
+    const USHORT pebBuild = *reinterpret_cast<USHORT*>(peb + 0x0AC);
+#endif
+    // ScyllaHide VersionPatch.h: FAKE_VERSION = 1337
+    if (pebBuild == 1337) return AD_DETECTED;
 
-    for (const wchar_t* name : modules)
+    if (DetectWow64TransitionHook()) return AD_DETECTED;
+
+    HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+    if (ntdll == nullptr)
     {
-        if (::GetModuleHandleW(name) != nullptr)
-        {
+        if (lastError != nullptr) *lastError = ERROR_MOD_NOT_FOUND;
+        return AD_NOT_DETECTED;
+    }
+
+    BYTE mem[16]{};
+    for (auto api : kNtdllHookTargets)
+    {
+        FARPROC fn = ::GetProcAddress(ntdll, api);
+        if (fn == nullptr) continue;
+        if (!SafeReadBytes(fn, mem, sizeof(mem))) continue;
+        if (IsScyllaJumper(mem, reinterpret_cast<const BYTE*>(fn), sizeof(mem)))
             return AD_DETECTED;
-        }
     }
 
     return AD_NOT_DETECTED;
 }
+
+
 
 DetectionStatus DetectBenignPath(DWORD* lastError)
 {
