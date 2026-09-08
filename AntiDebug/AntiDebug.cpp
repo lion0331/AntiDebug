@@ -575,7 +575,8 @@ namespace
             return false;
         }
         // DR7 低 8 位为 DR0-DR3 的 local/global enable；bit10 等保留位常为 1，不能用 Dr7 != 0。
-        return (ctx->Dr7 & 0xFF) != 0;
+        return ((ctx->Dr7 & 0xFF) != 0) &&
+       ((ctx->Dr0 | ctx->Dr1 | ctx->Dr2 | ctx->Dr3) != 0);
     }
 
     LONG CALLBACK DrVectoredHandler(PEXCEPTION_POINTERS pExcept)
@@ -592,7 +593,7 @@ namespace
         PCONTEXT ctx = pExcept->ContextRecord;
 
         // ③ 防御：ContextFlags 未声明含调试寄存器时，DR 字段不可信
-        if ((ctx->ContextFlags & CONTEXT_DEBUG_REGISTERS) != 0)
+        if ((ctx->ContextFlags & CONTEXT_DEBUG_REGISTERS) == CONTEXT_DEBUG_REGISTERS)
         {
             // ④ 判定：地址非 0 且 DR7 使能位（L0/G0..L3/G3 = 低 8 位）非 0
             if ((ctx->Dr0 | ctx->Dr1 | ctx->Dr2 | ctx->Dr3) != 0 &&
@@ -1203,6 +1204,18 @@ DetectionStatus DetectDrxVEH(DWORD* lastError)
 
     ::RaiseException(kCustomCode, 0, 0, nullptr);  // 同步：返回前回调已执行
     ::RemoveVectoredExceptionHandler(handler);
+
+ // 回退：若异常上下文中未包含 CONTEXT_DEBUG_REGISTERS（ContextRecord 的 DR 字段不可信），
+ // 直接读取当前线程 DR，保证检测有效。
+ if (!g_vehDrDetected)
+ {
+ CONTEXT ctx = {};
+ ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+ if (::GetThreadContext(::GetCurrentThread(), &ctx) && HasHardwareBreakpoint(&ctx))
+ {
+ g_vehDrDetected = TRUE;
+ }
+ }
 
     return g_vehDrDetected ? AD_DETECTED : AD_NOT_DETECTED;
 }
