@@ -744,8 +744,8 @@ DetectionStatus DetectNtCloseInvalidHandle(DWORD* lastError)
         caught = TRUE;
     }
 
-    // 本地 SEH 捕获到 STATUS_INVALID_HANDLE，说明没有调试器截获该异常。
-    return caught ? AD_NOT_DETECTED : AD_DETECTED;
+    // 本地 SEH 捕获到 STATUS_INVALID_HANDLE，说明NtClose 走了"被调试"分支 → 检测到调试器
+    return caught ? AD_DETECTED : AD_NOT_DETECTED;
 }
 
 DetectionStatus DetectDebugObject(DWORD* lastError)
