@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include <atomic>
 
 #ifndef LVS_EX_FULLROWSELECT
 #define LVS_EX_FULLROWSELECT 0x00000020
@@ -28,19 +29,22 @@ namespace
     const wchar_t kMainWindowClass[] = L"AntiDebug.MainWindow";
     const wchar_t kMainWindowTitle[] = L"反调试检测工具";
 
-    const int kDefaultWidth = 720;
-    const int kDefaultHeight = 480;
-    const int kMinWidth = 600;
-    const int kMinHeight = 400;
+    // 日志区软上限：超过后从头部丢弃最旧内容，防止多次检测后 Edit 控件文本无限膨胀拖慢 UI。
+    constexpr int kLogSoftLimitChars = 32768;
+
+    const int kDefaultWidth = 1600;
+    const int kDefaultHeight = 900;
+    const int kMinWidth = 1280;
+    const int kMinHeight = 720;
 
     const int kMargin = 12;
     const int kToolbarY = 8;
     const int kToolbarHeight = 26;
     const int kListY = 44;
-    const int kLogHeight = 110;
+    const int kLogHeight = 250;
     const int kButtonWidth = 88;
     const int kSummaryWidth = 140;
-    const int kLegendWidth = 72;
+    const int kLegendWidth = 110;
     const int kLegendGap = 4;
 
     HINSTANCE g_hInstance = nullptr;
@@ -55,12 +59,20 @@ namespace
     HWND g_hLog = nullptr;
     HFONT g_hFont = nullptr;
 
-    volatile BOOL g_cancel = FALSE;
-    volatile BOOL g_acceptMessages = FALSE;
+    // 跨线程标志统一用原子类型；volatile 既不提供原子性也不提供内存序。
+    std::atomic<bool> g_cancel{false};
+    std::atomic<bool> g_acceptMessages{false};
     HANDLE g_hThread = nullptr;
 
+    // g_rowStatus 只允许在 UI 线程读写（WM_APP_DETECTION_RESULT / custom draw），无需加锁。
     int g_rowStatus[kDetectionItemCount] = {};
-    volatile DWORD g_lastErrorByRow[kDetectionItemCount] = {};
+
+    // 把 lastError 与状态打包进 LPARAM：lastError 占高 62 位，status 占低 2 位。
+    LPARAM PackDetectionResult(DWORD lastError, int status)
+    {
+        ULONGLONG packed = (static_cast<ULONGLONG>(lastError) << 2) | (static_cast<DWORD>(status) & 0x3);
+        return static_cast<LPARAM>(packed);
+    }
 
     COLORREF GetStatusColor(int status)
     {
@@ -153,7 +165,7 @@ namespace
         wchar_t* copy = ::_wcsdup(buffer);
         if (copy != nullptr)
         {
-            if (!g_acceptMessages || g_hMainWnd == nullptr || !::PostMessageW(g_hMainWnd, WM_APP_LOG, 0, reinterpret_cast<LPARAM>(copy)))
+            if (!g_acceptMessages.load() || g_hMainWnd == nullptr || !::PostMessageW(g_hMainWnd, WM_APP_LOG, 0, reinterpret_cast<LPARAM>(copy)))
             {
                 ::free(copy);
             }
@@ -202,7 +214,16 @@ namespace
         // 只有原本就在底部时才自动滚到最新一行。避免拖动滚动条时内容跳动。
         bool autoScroll = IsLogScrolledToBottom();
 
+        // 追加前先做软截断：超过上限时丢弃头部最旧文本，避免文本无限膨胀。
         int length = ::GetWindowTextLengthW(g_hLog);
+        if (length > kLogSoftLimitChars)
+        {
+            const int excess = length - kLogSoftLimitChars;
+            ::SendMessageW(g_hLog, EM_SETSEL, 0, excess);
+            ::SendMessageW(g_hLog, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L""));
+            length = ::GetWindowTextLengthW(g_hLog);
+        }
+
         ::SendMessageW(g_hLog, EM_SETSEL, length, length);
         ::SendMessageW(g_hLog, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(text));
 
@@ -346,7 +367,6 @@ namespace
         for (int i = 0; i < kDetectionItemCount; ++i)
         {
             g_rowStatus[i] = AD_NOT_DETECTED;
-            g_lastErrorByRow[i] = 0;
         }
 
         UpdateSummary();
@@ -466,7 +486,7 @@ namespace
         }
     }
 
-    void UpdateRow(int row, int status)
+    void UpdateRow(int row, int status, DWORD lastError)
     {
         if (row < 0 || row >= kDetectionItemCount || g_hListView == nullptr)
         {
@@ -474,7 +494,6 @@ namespace
         }
 
         g_rowStatus[row] = status;
-        DWORD lastError = g_lastErrorByRow[row];
 
         ListView_SetItemText(g_hListView, row, 2, const_cast<wchar_t*>(GetStatusText(status)));
 
@@ -514,7 +533,7 @@ namespace
         }
 
         ResetList();
-        g_cancel = FALSE;
+        g_cancel.store(false);
 
         PostLog(L"开始检测，共 %d 项。\r\n", GetDetectionCount());
 
@@ -610,7 +629,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
     {
     case WM_CREATE:
         g_hMainWnd = hWnd;
-        g_acceptMessages = TRUE;
+        g_acceptMessages.store(true);
         CreateChildControls(hWnd);
         InitListColumns();
         ResetList();
@@ -652,8 +671,14 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
         break;
 
     case WM_APP_DETECTION_RESULT:
-        UpdateRow(static_cast<int>(wParam), static_cast<int>(lParam));
+    {
+        // lastError 由工作线程随消息打包（高 62 位），UI 线程无需再访问共享数组。
+        const ULONGLONG packed = static_cast<ULONGLONG>(lParam);
+        const DWORD lastError = static_cast<DWORD>(packed >> 2);
+        const int status = static_cast<int>(packed & 0x3);
+        UpdateRow(static_cast<int>(wParam), status, lastError);
         return 0;
+    }
 
     case WM_APP_DETECTION_DONE:
         OnDetectionDone();
@@ -681,10 +706,10 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
     }
 
     case WM_CLOSE:
-        g_acceptMessages = FALSE;
+        g_acceptMessages.store(false);
         if (g_hThread != nullptr)
         {
-            g_cancel = TRUE;
+            g_cancel.store(true);
             ::WaitForSingleObject(g_hThread, 5000);
             ::CloseHandle(g_hThread);
             g_hThread = nullptr;
@@ -724,7 +749,7 @@ DWORD WINAPI DetectionThreadProc(LPVOID /*lpParameter*/)
 
     for (int i = 0; i < count; ++i)
     {
-        if (g_cancel)
+        if (g_cancel.load())
         {
             break;
         }
@@ -746,17 +771,13 @@ DWORD WINAPI DetectionThreadProc(LPVOID /*lpParameter*/)
             PostLog(L"[%d/%d] 异常：%s，异常代码 0x%08lX\r\n", i + 1, count, item.name, lastError);
         }
 
-        InterlockedExchange(
-            reinterpret_cast<volatile LONG*>(&g_lastErrorByRow[i]),
-            static_cast<LONG>(lastError));
-
-        if (g_acceptMessages && g_hMainWnd != nullptr)
+        if (g_acceptMessages.load() && g_hMainWnd != nullptr)
         {
             ::PostMessageW(
                 g_hMainWnd,
                 WM_APP_DETECTION_RESULT,
                 static_cast<WPARAM>(i),
-                static_cast<LPARAM>(status));
+                PackDetectionResult(lastError, status));
         }
 
         PostLog(
@@ -768,7 +789,7 @@ DWORD WINAPI DetectionThreadProc(LPVOID /*lpParameter*/)
             lastError);
     }
 
-    if (g_acceptMessages && g_hMainWnd != nullptr)
+    if (g_acceptMessages.load() && g_hMainWnd != nullptr)
     {
         ::PostMessageW(g_hMainWnd, WM_APP_DETECTION_DONE, 0, 0);
     }
@@ -782,6 +803,16 @@ int APIENTRY wWinMain(HINSTANCE hInstance,
     int nShowCmd)
 {
     g_hInstance = hInstance;
+
+    // 在创建任何窗口前声明系统 DPI 感知，避免高分屏下被系统按位图拉伸导致文字模糊。
+    ::SetProcessDPIAware();
+
+    // UI 行状态数组为编译期固定容量；检测项超过容量时静默截断会丢结果，直接拒绝启动。
+    if (GetDetectionCount() > kDetectionItemCount)
+    {
+        ::MessageBoxW(nullptr, L"检测项数量超过 UI 容量，请同步增大 kDetectionItemCount。", L"反调试检测工具", MB_ICONERROR);
+        return 1;
+    }
 
     INITCOMMONCONTROLSEX icc = {};
     icc.dwSize = sizeof(icc);

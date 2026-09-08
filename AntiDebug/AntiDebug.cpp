@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include <array>
 #include <tlhelp32.h>
 #include <shlwapi.h>
 
@@ -136,13 +137,58 @@ namespace
         return pfn;
     }
 
-    ULONG_PTR GetPebAddress()
+    // 保护式读取任意进程内存：先 VirtualQuery 确认页面已提交、可读且不跨 region，
+    // 避免被 hook/反反调试工具改写页保护时直接访问违例。
+    bool SafeReadBytes(const void* addr, void* buf, SIZE_T size)
+    {
+        if (addr == nullptr || buf == nullptr || size == 0)
+        {
+            return false;
+        }
+
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (::VirtualQuery(addr, &mbi, sizeof(mbi)) == 0)
+        {
+            return false;
+        }
+        if (mbi.State != MEM_COMMIT)
+        {
+            return false;
+        }
+        if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
+        {
+            return false;
+        }
+
+        const BYTE* start = static_cast<const BYTE*>(addr);
+        const BYTE* regionEnd = static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+        if (start + size > regionEnd)
+        {
+            return false;
+        }
+
+        ::memcpy(buf, addr, size);
+        return true;
+    }
+
+    BYTE* GetCurrentPeb()
     {
 #if defined(_WIN64)
-        return __readgsqword(0x60);
+        return reinterpret_cast<BYTE*>(__readgsqword(0x60));
 #else
-        return __readfsdword(0x30);
+        return reinterpret_cast<BYTE*>(__readfsdword(0x30));
 #endif
+    }
+
+    // 保护式读取 PEB 字段（偏移基于 x64: gs:[0x60]；x86: fs:[0x30]）。
+    bool TryReadPeb(DWORD offset, void* out, SIZE_T size)
+    {
+        BYTE* peb = GetCurrentPeb();
+        if (peb == nullptr)
+        {
+            return false;
+        }
+        return SafeReadBytes(peb + offset, out, size);
     }
 
     bool QueryInfo(HANDLE process, ULONG infoClass, PVOID buffer, ULONG bufferSize, DWORD* lastError)
@@ -365,11 +411,10 @@ namespace
 
     DWORD Crc32(const void* data, size_t size)
     {
-        static DWORD table[256] = {};
-        static BOOL tableReady = FALSE;
-
-        if (!tableReady)
-        {
+        // 函数级 static 局部对象在 C++11 起保证线程安全的初始化，
+        // 避免原实现中无锁的 tableReady 标志产生竞态。
+        static const std::array<DWORD, 256> s_table = []() {
+            std::array<DWORD, 256> table = {};
             for (DWORD i = 0; i < 256; ++i)
             {
                 DWORD crc = i;
@@ -386,14 +431,14 @@ namespace
                 }
                 table[i] = crc;
             }
-            tableReady = TRUE;
-        }
+            return table;
+        }();
 
         DWORD crc = 0xFFFFFFFFUL;
         const BYTE* p = static_cast<const BYTE*>(data);
         for (size_t i = 0; i < size; ++i)
         {
-            crc = (crc >> 8) ^ table[(crc ^ p[i]) & 0xFF];
+            crc = (crc >> 8) ^ s_table[(crc ^ p[i]) & 0xFF];
         }
         return crc ^ 0xFFFFFFFFUL;
     }
@@ -489,8 +534,11 @@ namespace
                     remaining -= chunk;
                 }
 
-                if (readable == 0)
+                if (readable == 0 || remaining != 0)
                 {
+                    // readable==0 表示整段不可读；remaining!=0 表示读取中遇页保护被中断。
+                    // 两者都意味着 CRC 只能覆盖部分 .text，应失败而非返回部分结果，
+                    // 否则与基准比较会产生永久误报。
                     if (lastError != nullptr)
                     {
                         *lastError = ERROR_INVALID_ADDRESS;
@@ -509,12 +557,15 @@ namespace
         return 0;
     }
 
-    volatile DWORD g_codeCrcBaseline = 0;
-    volatile BOOL g_codeCrcReady = FALSE;
+    // 以下全局均在"创建工作线程之前"由主线程写入（InitCrcBaseline / InitBenignPath），
+    // 线程创建构成 happens-before，检测线程读取无需再加锁，故用普通类型即可。
+    DWORD g_codeCrcBaseline = 0;
+    BOOL g_codeCrcReady = FALSE;
     wchar_t g_benignPath[MAX_PATH * 2] = {};
-    volatile ULONGLONG g_tickCountDeltaThresholdMs = 400;
+    ULONGLONG g_tickCountDeltaThresholdMs = 400;
 
-    static volatile BOOL g_vehDrDetected = FALSE;
+    // g_vehDrDetected 只由 VEH 回调写、DetectDrxVEH 同线程同步读（RaiseException 返回前回调已完成）。
+    BOOL g_vehDrDetected = FALSE;
     static constexpr DWORD kCustomCode = 0x20474343UL;
 
     bool HasHardwareBreakpoint(const CONTEXT* ctx)
@@ -665,8 +716,9 @@ DetectionStatus DetectBeingDebugged(DWORD* lastError)
         *lastError = 0;
     }
 
-    ULONG_PTR peb = GetPebAddress();
-    if (peb == 0)
+    // PEB.BeingDebugged 偏移 0x02（x64/x86 一致）。
+    BYTE beingDebugged = 0;
+    if (!TryReadPeb(2, &beingDebugged, sizeof(beingDebugged)))
     {
         if (lastError != nullptr)
         {
@@ -675,9 +727,6 @@ DetectionStatus DetectBeingDebugged(DWORD* lastError)
         return AD_FAILED;
     }
 
-    // volatile 读取，防止 /O2 下被优化掉。
-    volatile BYTE* p = reinterpret_cast<volatile BYTE*>(peb);
-    BYTE beingDebugged = p[2];
     return beingDebugged != 0 ? AD_DETECTED : AD_NOT_DETECTED;
 }
 
@@ -688,8 +737,14 @@ DetectionStatus DetectNtGlobalFlag(DWORD* lastError)
         *lastError = 0;
     }
 
-    ULONG_PTR peb = GetPebAddress();
-    if (peb == 0)
+#if defined(_WIN64)
+    const DWORD ntGlobalFlagOffset = 0xBC;
+#else
+    const DWORD ntGlobalFlagOffset = 0x68;
+#endif
+
+    DWORD ntGlobalFlag = 0;
+    if (!TryReadPeb(ntGlobalFlagOffset, &ntGlobalFlag, sizeof(ntGlobalFlag)))
     {
         if (lastError != nullptr)
         {
@@ -698,14 +753,7 @@ DetectionStatus DetectNtGlobalFlag(DWORD* lastError)
         return AD_FAILED;
     }
 
-#if defined(_WIN64)
-    const ptrdiff_t ntGlobalFlagOffset = 0xBC;
-#else
-    const ptrdiff_t ntGlobalFlagOffset = 0x68;
-#endif
-
-    volatile DWORD* ntGlobalFlag = reinterpret_cast<volatile DWORD*>(peb + ntGlobalFlagOffset);
-    return ((*ntGlobalFlag) & 0x70) != 0 ? AD_DETECTED : AD_NOT_DETECTED;
+    return (ntGlobalFlag & 0x70) != 0 ? AD_DETECTED : AD_NOT_DETECTED;
 }
 
 DetectionStatus DetectIsDebuggerPresent(DWORD* lastError)
@@ -869,8 +917,9 @@ DetectionStatus DetectNtCloseInvalidHandle(DWORD* lastError)
         return AD_FAILED;
     }
 
-    // volatile 防止编译器把无效句柄调用优化掉。
-    volatile HANDLE invalidHandle = reinterpret_cast<HANDLE>(static_cast<INT_PTR>(0x9999));
+    // 0xDEADBEEF 远大于常规句柄分配范围，避免与进程真实句柄值撞上导致误关闭有效句柄；
+    // NtClose 是外部函数调用（存在不可知副作用），编译器不会将其删除，无需 volatile。
+    HANDLE invalidHandle = reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(0xDEADBEEF));
     BOOL caught = FALSE;
 
     __try
@@ -882,8 +931,10 @@ DetectionStatus DetectNtCloseInvalidHandle(DWORD* lastError)
         caught = TRUE;
     }
 
-    // 正常进程：NtClose 抛出的 kNtStatusInvalidHandle 会被本地 SEH 捕获。
-    // 被调试时：调试器先收到首次异常并吞掉，本地 SEH 通常捕获不到 → 判定为检测到调试器。
+    // 内核 ObpCloseHandle 仅在进程存在调试端口（或启用了内核调试器）时，
+    // 才会把 STATUS_INVALID_HANDLE 作为异常投递给用户态；
+    // 正常进程直接返回错误码、不产生异常 → caught=FALSE。
+    // 注意：若调试器把该 first-chance 异常标记为已处理并吞掉，本地 SEH 捕获不到 → 漏报。
     return caught ? AD_DETECTED : AD_NOT_DETECTED;
 }
 
@@ -1011,9 +1062,9 @@ DetectionStatus DetectTickCountDelta(DWORD* lastError)
         *lastError = 0;
     }
 
-    volatile ULONGLONG before = ::GetTickCount64();
+    ULONGLONG before = ::GetTickCount64();
     ::Sleep(100);
-    volatile ULONGLONG after = ::GetTickCount64();
+    ULONGLONG after = ::GetTickCount64();
     ULONGLONG delta = after - before;
 
     // 注意：多线程/高负载下可能出现误报，阈值可按环境调整。
@@ -1178,28 +1229,6 @@ static const char* const kNtdllHookTargets[] = {
     "KiUserExceptionDispatcher",
 };
 
-static bool SafeReadBytes(const void* addr, void* buf, SIZE_T size)
-{
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (::VirtualQuery(addr, &mbi, sizeof(mbi)) == 0) return false;
-    if (mbi.State != MEM_COMMIT) return false;
-    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
-    const BYTE* start = static_cast<const BYTE*>(addr);
-    const BYTE* regionEnd = static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
-    if (start + size > regionEnd) return false;
-    memcpy(buf, addr, size);
-    return true;
-}
-
-static BYTE* CurrentPeb()
-{
-#ifdef _WIN64
-    return reinterpret_cast<BYTE*>(__readgsqword(0x60));
-#else
-    return reinterpret_cast<BYTE*>(__readfsdword(0x30));
-#endif
-}
-
 static bool IsPrivateExec(const void* addr)
 {
     if (addr == nullptr) return false;
@@ -1257,11 +1286,10 @@ static bool DetectWow64TransitionHook()
     if (!SafeReadBytes(gate, farJmp, sizeof(farJmp))) return false;
     if (farJmp[0] != 0xEA) return false;
 
-    const USHORT selector = *reinterpret_cast<USHORT*>(farJmp + 5);
     const ULONG dest = *reinterpret_cast<ULONG*>(farJmp + 1);
-    // 正常 wow64cpu 用 0x33；ScyllaHide 改成 0x23 跳到匿名 HookedNativeCallInternal
-    if (selector == 0x23 && IsPrivateExec(reinterpret_cast<void*>(static_cast<ULONG_PTR>(dest))))
-        return true;
+    // 正常 wow64cpu 门目标落在 wow64cpu.dll 映像内（MEM_IMAGE，selector 0x33）；
+    // ScyllaHide 把 selector 改为 0x23 且目标位于匿名可执行页（HookedNativeCallInternal）。
+    // 统一按"目标是否在匿名可执行页"判定即可覆盖两种特征。
     return IsPrivateExec(reinterpret_cast<void*>(static_cast<ULONG_PTR>(dest)));
 #endif
 }
@@ -1270,20 +1298,19 @@ DetectionStatus DetectScyllaHide(DWORD* lastError)
 {
     if (lastError != nullptr) *lastError = 0;
 
-    BYTE* peb = CurrentPeb();
-    if (peb == nullptr)
+#if defined(_WIN64)
+    const DWORD osBuildOffset = 0x120;
+#else
+    const DWORD osBuildOffset = 0x0AC;
+#endif
+    USHORT osBuild = 0;
+    if (!TryReadPeb(osBuildOffset, &osBuild, sizeof(osBuild)))
     {
         if (lastError != nullptr) *lastError = ERROR_INVALID_ADDRESS;
         return AD_FAILED;
     }
-
-#ifdef _WIN64
-    const USHORT pebBuild = *reinterpret_cast<USHORT*>(peb + 0x120);
-#else
-    const USHORT pebBuild = *reinterpret_cast<USHORT*>(peb + 0x0AC);
-#endif
     // ScyllaHide VersionPatch.h: FAKE_VERSION = 1337
-    if (pebBuild == 1337) return AD_DETECTED;
+    if (osBuild == 1337) return AD_DETECTED;
 
     if (DetectWow64TransitionHook()) return AD_DETECTED;
 
@@ -1498,7 +1525,7 @@ namespace
         { 6, L"DebugObjectHandle", L"NtQueryInformationProcess(ProcessDebugObjectHandle=0x1E)，句柄非空即被调试", &DetectDebugObjectHandle },
         { 7, L"DebugFlags", L"NtQueryInformationProcess(ProcessDebugFlags=0x1F)，被调试时返回 0", &DetectDebugFlags },
         { 8, L"父进程检测", L"查询父进程名，不在白名单(explorer/cmd/powershell/WindowsTerminal 等)即被调试", &DetectParentProcess },
-        { 9, L"NtClose 无效句柄", L"动态解析 ntdll!NtClose 对 (HANDLE)0x9999 调用，SEH 捕获 STATUS_INVALID_HANDLE", &DetectNtCloseInvalidHandle },
+        { 9, L"NtClose 无效句柄", L"动态解析 ntdll!NtClose 对 (HANDLE)0xDEADBEEF 调用，SEH 捕获 STATUS_INVALID_HANDLE", &DetectNtCloseInvalidHandle },
         { 10, L"DebugObject 类型", L"NtDuplicateObject 复制调试对象句柄，NtQueryObject 判断类型名为 DebugObject", &DetectDebugObject },
         { 11, L"窗口名黑名单", L"EnumWindows+GetWindowTextW，匹配调试器窗口名关键字（避免短词误报）", &DetectWindowDebugger },
         { 12, L"TickCount 差值", L"GetTickCount64 前后 Sleep(100)，差值超阈值判定被调试", &DetectTickCountDelta },
