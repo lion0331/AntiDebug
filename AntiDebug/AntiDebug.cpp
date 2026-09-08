@@ -1109,8 +1109,6 @@ DetectionStatus DetectScyllaHide(DWORD* lastError)
     return AD_NOT_DETECTED;
 }
 
-
-
 DetectionStatus DetectBenignPath(DWORD* lastError)
 {
     if (lastError != nullptr)
