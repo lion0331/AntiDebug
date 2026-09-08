@@ -2,8 +2,8 @@
 
 #include <windows.h>
 
-// 与 AntiDebug.cpp 中 GetDetectionCount() 保持一致（22 项全部实现）。
-constexpr int kDetectionItemCount = 22;
+// UI 行状态数组容量，必须 >= GetDetectionCount()。
+constexpr int kDetectionItemCount = 32;
 
 constexpr UINT WM_APP_DETECTION_RESULT = WM_APP + 1; // wParam=行号, lParam=DetectionStatus
 constexpr UINT WM_APP_DETECTION_DONE = WM_APP + 2;   // 全部完成

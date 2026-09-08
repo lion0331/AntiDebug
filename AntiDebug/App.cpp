@@ -19,7 +19,9 @@
 #define LVS_EX_DOUBLEBUFFER 0x00010000
 #endif
 
+#pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "Comctl32.lib")
+#pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 namespace
 {
@@ -54,6 +56,7 @@ namespace
     HFONT g_hFont = nullptr;
 
     volatile BOOL g_cancel = FALSE;
+    volatile BOOL g_acceptMessages = FALSE;
     HANDLE g_hThread = nullptr;
 
     int g_rowStatus[kDetectionItemCount] = {};
@@ -104,7 +107,12 @@ namespace
     void UpdateSummary()
     {
         int detected = 0;
-        for (int i = 0; i < kDetectionItemCount; ++i)
+        int count = GetDetectionCount();
+        if (count > kDetectionItemCount)
+        {
+            count = kDetectionItemCount;
+        }
+        for (int i = 0; i < count; ++i)
         {
             if (g_rowStatus[i] == AD_DETECTED)
             {
@@ -113,7 +121,7 @@ namespace
         }
 
         wchar_t text[64] = {};
-        _snwprintf_s(text, _countof(text), _TRUNCATE, L"已检测到 %d / %d", detected, kDetectionItemCount);
+        _snwprintf_s(text, _countof(text), _TRUNCATE, L"已检测到 %d / %d", detected, count);
         ::SetWindowTextW(g_hSummary, text);
     }
 
@@ -145,7 +153,7 @@ namespace
         wchar_t* copy = ::_wcsdup(buffer);
         if (copy != nullptr)
         {
-            if (!::PostMessageW(g_hMainWnd, WM_APP_LOG, 0, reinterpret_cast<LPARAM>(copy)))
+            if (!g_acceptMessages || g_hMainWnd == nullptr || !::PostMessageW(g_hMainWnd, WM_APP_LOG, 0, reinterpret_cast<LPARAM>(copy)))
             {
                 ::free(copy);
             }
@@ -371,10 +379,12 @@ namespace
             g_hInstance,
             nullptr);
 
+        wchar_t summaryText[64] = {};
+        _snwprintf_s(summaryText, _countof(summaryText), _TRUNCATE, L"已检测到 0 / %d", GetDetectionCount());
         g_hSummary = ::CreateWindowExW(
             0,
             L"STATIC",
-            L"已检测到 0 / 22",
+            summaryText,
             WS_CHILD | WS_VISIBLE | SS_RIGHT,
             0, 0, 0, 0,
             parent,
@@ -600,6 +610,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
     {
     case WM_CREATE:
         g_hMainWnd = hWnd;
+        g_acceptMessages = TRUE;
         CreateChildControls(hWnd);
         InitListColumns();
         ResetList();
@@ -670,12 +681,23 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
     }
 
     case WM_CLOSE:
+        g_acceptMessages = FALSE;
         if (g_hThread != nullptr)
         {
             g_cancel = TRUE;
-            ::WaitForSingleObject(g_hThread, 3000);
+            ::WaitForSingleObject(g_hThread, 5000);
             ::CloseHandle(g_hThread);
             g_hThread = nullptr;
+        }
+        {
+            MSG pending = {};
+            while (::PeekMessageW(&pending, hWnd, WM_APP_LOG, WM_APP_LOG, PM_REMOVE))
+            {
+                ::free(reinterpret_cast<void*>(pending.lParam));
+            }
+            while (::PeekMessageW(&pending, hWnd, WM_APP_DETECTION_RESULT, WM_APP_DETECTION_DONE, PM_REMOVE))
+            {
+            }
         }
         ::DestroyWindow(hWnd);
         return 0;
@@ -728,11 +750,14 @@ DWORD WINAPI DetectionThreadProc(LPVOID /*lpParameter*/)
             reinterpret_cast<volatile LONG*>(&g_lastErrorByRow[i]),
             static_cast<LONG>(lastError));
 
-        ::PostMessageW(
-            g_hMainWnd,
-            WM_APP_DETECTION_RESULT,
-            static_cast<WPARAM>(i),
-            static_cast<LPARAM>(status));
+        if (g_acceptMessages && g_hMainWnd != nullptr)
+        {
+            ::PostMessageW(
+                g_hMainWnd,
+                WM_APP_DETECTION_RESULT,
+                static_cast<WPARAM>(i),
+                static_cast<LPARAM>(status));
+        }
 
         PostLog(
             L"[%d/%d] 结束：%s，状态=%d，错误码=0x%08lX\r\n",
@@ -743,7 +768,10 @@ DWORD WINAPI DetectionThreadProc(LPVOID /*lpParameter*/)
             lastError);
     }
 
-    ::PostMessageW(g_hMainWnd, WM_APP_DETECTION_DONE, 0, 0);
+    if (g_acceptMessages && g_hMainWnd != nullptr)
+    {
+        ::PostMessageW(g_hMainWnd, WM_APP_DETECTION_DONE, 0, 0);
+    }
     return 0;
 }
 
@@ -760,9 +788,13 @@ int APIENTRY wWinMain(HINSTANCE hInstance,
     icc.dwICC = ICC_LISTVIEW_CLASSES;
     ::InitCommonControlsEx(&icc);
 
-    // 第 13 项 .text CRC32 基准值由调用方注入：
-    // 在干净环境下通过 ComputeCodeCrc32(nullptr) 取得基准值后，取消下一行注释并填入。
-    // InitCrcBaseline(0x00000000);
+    DWORD crcError = 0;
+    DWORD crc = ComputeCodeCrc32(&crcError);
+    if (crcError == 0)
+    {
+        InitCrcBaseline(crc);
+    }
+    InitDefaultBenignPath();
 
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);

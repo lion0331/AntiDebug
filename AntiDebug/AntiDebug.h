@@ -43,7 +43,7 @@ DetectionStatus DetectDebugObjectHandle(DWORD* lastError);
 // 7. NtQueryInformationProcess(ProcessDebugFlags = 0x1F)，被调试时返回 0
 DetectionStatus DetectDebugFlags(DWORD* lastError);
 
-// 8. 查询父进程名，与白名单比对（默认 explorer.exe）
+// 8. 查询父进程名，与白名单比对（explorer/cmd/powershell/WindowsTerminal 等）
 DetectionStatus DetectParentProcess(DWORD* lastError);
 
 // 9. 动态解析 ntdll!NtClose，对无效句柄调用，SEH 捕获 STATUS_INVALID_HANDLE
@@ -52,7 +52,7 @@ DetectionStatus DetectNtCloseInvalidHandle(DWORD* lastError);
 // 10. NtDuplicateObject + NtQueryObject(ObjectTypeInformation=2)，判断类型名为 DebugObject
 DetectionStatus DetectDebugObject(DWORD* lastError);
 
-// 11. EnumWindows + GetWindowTextW 匹配调试器窗口名黑名单
+// 11. EnumWindows + GetWindowTextW 匹配调试器窗口名黑名单（避免短词误报）
 DetectionStatus DetectWindowDebugger(DWORD* lastError);
 
 // 12. GetTickCount64 前后 Sleep(100)，差值超阈值判定被调试
@@ -61,19 +61,19 @@ DetectionStatus DetectTickCountDelta(DWORD* lastError);
 // 13. 解析 PE .text 段计算 CRC32，与 InitCrcBaseline 注入的基准比对
 DetectionStatus DetectCodeCRC32(DWORD* lastError);
 
-// 14. GetThreadContext 读 DR0-DR7（CONTEXT_DEBUG_REGISTERS）
+// 14. 挂起同进程其他线程后 GetThreadContext 读 DR0-DR7
 DetectionStatus DetectDrxContext(DWORD* lastError);
 
 // 15. AddVectoredExceptionHandler + RaiseException，回调从 ContextRecord 读 DR
 DetectionStatus DetectDrxVEH(DWORD* lastError);
 
-// 16. 检测 ScyllaHide 相关模块是否加载
+// 16. 检测 ScyllaHide：PEB 伪造版本、Wow64Transition、ntdll inline hook
 DetectionStatus DetectScyllaHide(DWORD* lastError);
 
-// 17. GetModuleFileNameW 与期望路径比对（默认 C:\）
+// 17. GetModuleFileNameW 与 InitBenignPath 设置的期望路径前缀比对
 DetectionStatus DetectBenignPath(DWORD* lastError);
 
-// 18. NtQuerySystemInformation(SystemKernelDebuggerInformation=0x23)
+// 18. NtQuerySystemInformation(SystemKernelDebuggerInformation=0x23)，Enabled 且 Present
 DetectionStatus DetectKernelDebugger(DWORD* lastError);
 
 // 19. Toolhelp32Snapshot 枚举进程名，匹配 cheatengine*
@@ -82,7 +82,7 @@ DetectionStatus DetectCheatEngine(DWORD* lastError);
 // 20. Toolhelp32Snapshot 枚举进程名，匹配 x32dbg.exe / x64dbg.exe
 DetectionStatus DetectX64dbg(DWORD* lastError);
 
-// 21. Toolhelp32Snapshot 枚举进程名，匹配 HR* / Huorong*
+// 21. Toolhelp32Snapshot 枚举进程名，匹配 HrSword.exe / HipsMain.exe / Huorong*
 DetectionStatus DetectHuorongSword(DWORD* lastError);
 
 // 22. Toolhelp32Snapshot 枚举进程名，匹配 PCHunter*
@@ -94,5 +94,8 @@ void InitCrcBaseline(DWORD crc);
 // 计算当前模块 .text 段 CRC32，供调用方在干净环境下生成基准值。
 DWORD ComputeCodeCrc32(DWORD* lastError);
 
-// 设置第 17 项的期望路径（默认为 C:\）。
+// 设置第 17 项的期望路径前缀；传入空则该项失败。
 void InitBenignPath(const wchar_t* path);
+
+// 将第 17 项期望路径设为当前模块所在目录。
+void InitDefaultBenignPath();

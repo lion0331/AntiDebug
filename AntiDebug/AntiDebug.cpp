@@ -6,6 +6,7 @@
 #include <string.h>
 #include <wchar.h>
 #include <tlhelp32.h>
+#include <shlwapi.h>
 
 #ifndef PROCESS_QUERY_LIMITED_INFORMATION
 #define PROCESS_QUERY_LIMITED_INFORMATION 0x1000
@@ -55,6 +56,10 @@ namespace
     const ULONG ObjectTypeInformation = 2;
     const ULONG SystemKernelDebuggerInformation = 0x23;
 
+    const NtStatus kNtStatusInfoLengthMismatch = static_cast<NtStatus>(0xC0000004L);
+    const NtStatus kNtStatusInvalidHandle = static_cast<NtStatus>(0xC0000008L);
+    const NtStatus kNtStatusPortNotSet = static_cast<NtStatus>(0xC0000353L);
+
     const wchar_t kDebugObjectTypeName[] = L"DebugObject";
 
     // 与 winternl.h 中 PROCESS_BASIC_INFORMATION 布局一致，自行定义以避免引入额外头文件。
@@ -93,8 +98,12 @@ namespace
     template <typename T>
     T GetNtdllFunction(const char* name)
     {
-        return reinterpret_cast<T>(
-            ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), name));
+        HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+        if (ntdll == nullptr)
+        {
+            return nullptr;
+        }
+        return reinterpret_cast<T>(::GetProcAddress(ntdll, name));
     }
 
     NtQueryInformationProcessFn GetNtQueryInformationProcess()
@@ -169,12 +178,63 @@ namespace
         return true;
     }
 
+    bool QueryInfoAllowStatus(HANDLE process, ULONG infoClass, PVOID buffer, ULONG bufferSize, NtStatus allowedStatus, DWORD* lastError)
+    {
+        DWORD statusCode = 0;
+        if (QueryInfo(process, infoClass, buffer, bufferSize, &statusCode))
+        {
+            if (lastError != nullptr)
+            {
+                *lastError = 0;
+            }
+            return true;
+        }
+        if (static_cast<NtStatus>(statusCode) == allowedStatus)
+        {
+            if (lastError != nullptr)
+            {
+                *lastError = 0;
+            }
+            return true;
+        }
+        if (lastError != nullptr)
+        {
+            *lastError = statusCode;
+        }
+        return false;
+    }
+
+    void CloseDebugObjectHandle(HANDLE handle)
+    {
+        if (handle == nullptr)
+        {
+            return;
+        }
+
+        NtCloseFn close = GetNtClose();
+        if (close != nullptr)
+        {
+            close(handle);
+            return;
+        }
+        ::CloseHandle(handle);
+    }
+
     bool IsWhitelistedParent(const wchar_t* imagePath)
     {
-        // 白名单可在此配置；默认仅放行 explorer.exe。
+        // 白名单可在此配置。
         static const wchar_t* const whitelist[] =
         {
-            L"explorer.exe"
+            L"explorer.exe",
+            L"cmd.exe",
+            L"powershell.exe",
+            L"pwsh.exe",
+            L"windowsterminal.exe",
+            L"openconsole.exe",
+            L"svchost.exe",
+            L"userinit.exe",
+            L"winlogon.exe",
+            L"services.exe"
         };
 
         const wchar_t* fileName = ::wcsrchr(imagePath, L'\\');
@@ -251,7 +311,7 @@ namespace
 
         ULONG needed = 0;
         NtStatus status = query(handle, ObjectTypeInformation, nullptr, 0, &needed);
-        if (status != 0 && status != static_cast<NtStatus>(0xC0000004L)) // STATUS_INFO_LENGTH_MISMATCH
+        if (status != 0 && status != kNtStatusInfoLengthMismatch)
         {
             if (lastError != nullptr)
             {
@@ -385,6 +445,10 @@ namespace
                 {
                     size = sections[i].SizeOfRawData;
                 }
+                if (sections[i].SizeOfRawData != 0 && size > sections[i].SizeOfRawData)
+                {
+                    size = sections[i].SizeOfRawData;
+                }
                 if (size == 0)
                 {
                     if (lastError != nullptr)
@@ -395,7 +459,46 @@ namespace
                 }
 
                 const BYTE* data = base + sections[i].VirtualAddress;
-                return Crc32(data, size);
+                MEMORY_BASIC_INFORMATION mbi = {};
+                SIZE_T readable = 0;
+                const BYTE* cursor = data;
+                SIZE_T remaining = size;
+                while (remaining > 0)
+                {
+                    if (::VirtualQuery(cursor, &mbi, sizeof(mbi)) == 0)
+                    {
+                        break;
+                    }
+                    if (mbi.State != MEM_COMMIT)
+                    {
+                        break;
+                    }
+                    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
+                    {
+                        break;
+                    }
+
+                    const BYTE* regionEnd = static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+                    SIZE_T chunk = static_cast<SIZE_T>(regionEnd - cursor);
+                    if (chunk > remaining)
+                    {
+                        chunk = remaining;
+                    }
+                    readable += chunk;
+                    cursor += chunk;
+                    remaining -= chunk;
+                }
+
+                if (readable == 0)
+                {
+                    if (lastError != nullptr)
+                    {
+                        *lastError = ERROR_INVALID_ADDRESS;
+                    }
+                    return 0;
+                }
+
+                return Crc32(data, readable);
             }
         }
 
@@ -407,26 +510,49 @@ namespace
     }
 
     volatile DWORD g_codeCrcBaseline = 0;
-    wchar_t g_benignPath[MAX_PATH * 2] = L"C:\\";
-    volatile ULONGLONG g_tickCountDeltaThresholdMs = 150;
+    volatile BOOL g_codeCrcReady = FALSE;
+    wchar_t g_benignPath[MAX_PATH * 2] = {};
+    volatile ULONGLONG g_tickCountDeltaThresholdMs = 400;
 
-    volatile BOOL g_vehDrDetected = FALSE;
+    static volatile BOOL g_vehDrDetected = FALSE;
+    static constexpr DWORD kCustomCode = 0x20474343UL;
 
-    LONG CALLBACK DrVectoredHandler(EXCEPTION_POINTERS* ExceptionInfo)
+    bool HasHardwareBreakpoint(const CONTEXT* ctx)
     {
-        if (ExceptionInfo != nullptr &&
-            ExceptionInfo->ExceptionRecord != nullptr &&
-            ExceptionInfo->ExceptionRecord->ExceptionCode == 0x20474343UL)
+        if (ctx == nullptr)
         {
-            PCONTEXT ctx = ExceptionInfo->ContextRecord;
-            if (ctx != nullptr &&
-                (ctx->Dr0 != 0 || ctx->Dr1 != 0 || ctx->Dr2 != 0 || ctx->Dr3 != 0 || ctx->Dr7 != 0))
+            return false;
+        }
+        // DR7 低 8 位为 DR0-DR3 的 local/global enable；bit10 等保留位常为 1，不能用 Dr7 != 0。
+        return (ctx->Dr7 & 0xFF) != 0;
+    }
+
+    LONG CALLBACK DrVectoredHandler(PEXCEPTION_POINTERS pExcept)
+    {
+        // ① 只处理自己抛的异常码，其余一律继续分发（不吞别人的异常）
+        if (pExcept == nullptr ||
+            pExcept->ExceptionRecord == nullptr ||
+            pExcept->ContextRecord == nullptr ||
+            pExcept->ExceptionRecord->ExceptionCode != kCustomCode)
+        {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        PCONTEXT ctx = pExcept->ContextRecord;
+
+        // ③ 防御：ContextFlags 未声明含调试寄存器时，DR 字段不可信
+        if ((ctx->ContextFlags & CONTEXT_DEBUG_REGISTERS) != 0)
+        {
+            // ④ 判定：地址非 0 且 DR7 使能位（L0/G0..L3/G3 = 低 8 位）非 0
+            if ((ctx->Dr0 | ctx->Dr1 | ctx->Dr2 | ctx->Dr3) != 0 &&
+                (ctx->Dr7 & 0xFF) != 0)
             {
                 g_vehDrDetected = TRUE;
             }
-            return EXCEPTION_CONTINUE_EXECUTION;
         }
-        return EXCEPTION_CONTINUE_SEARCH;
+
+        // ② 必须吞掉自己的异常，否则未处理异常会崩掉进程
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
 
     struct WindowSearchContext
@@ -439,26 +565,25 @@ namespace
     BOOL CALLBACK DebuggerWindowEnumProc(HWND hwnd, LPARAM lParam)
     {
         auto* ctx = reinterpret_cast<WindowSearchContext*>(lParam);
-        if (ctx == nullptr)
-        {
-            return TRUE;
-        }
+        if (ctx == nullptr) return FALSE;
 
         wchar_t title[256] = {};
-        int length = ::GetWindowTextW(hwnd, title, _countof(title));
-        if (length > 0)
+        if (::GetWindowTextW(hwnd, title, _countof(title)) <= 0)
         {
-            for (int i = 0; i < ctx->keywordCount; ++i)
-            {
-                if (ContainsIgnoreCase(title, ctx->keywords[i]))
-                {
-                    ctx->found = TRUE;
-                    return TRUE; // 不提前停止，避免与 EnumWindows 失败混淆
-                }
+            return TRUE;  // 无标题/被 UIPI 拦截，跳过
+        }
+
+        for (int i = 0; i < ctx->keywordCount; i++)
+        {
+            if (::StrStrIW(title, ctx->keywords[i]) != nullptr)
+            {  // 大小写不敏感
+                ctx->found = TRUE;
+                return FALSE;  // 提前终止，EnumWindows 将返回 FALSE（属正常）
             }
         }
         return TRUE;
     }
+
 
     typedef bool (*ProcessNameMatcher)(const wchar_t* processName);
 
@@ -522,7 +647,8 @@ namespace
 
     bool MatchHuorongSword(const wchar_t* processName)
     {
-        return ::_wcsnicmp(processName, L"hr", 2) == 0 ||
+        return ::_wcsicmp(processName, L"HrSword.exe") == 0 ||
+               ::_wcsicmp(processName, L"HipsMain.exe") == 0 ||
                ::_wcsnicmp(processName, L"huorong", 7) == 0;
     }
 
@@ -621,13 +747,13 @@ DetectionStatus DetectDebugPort(DWORD* lastError)
         *lastError = 0;
     }
 
-    DWORD debugPort = 0;
+    HANDLE debugPort = nullptr;
     if (!QueryInfo(::GetCurrentProcess(), ProcessDebugPort, &debugPort, sizeof(debugPort), lastError))
     {
         return AD_FAILED;
     }
 
-    return debugPort != 0 ? AD_DETECTED : AD_NOT_DETECTED;
+    return debugPort != nullptr ? AD_DETECTED : AD_NOT_DETECTED;
 }
 
 DetectionStatus DetectDebugObjectHandle(DWORD* lastError)
@@ -638,12 +764,24 @@ DetectionStatus DetectDebugObjectHandle(DWORD* lastError)
     }
 
     HANDLE debugObject = nullptr;
-    if (!QueryInfo(::GetCurrentProcess(), ProcessDebugObjectHandle, &debugObject, sizeof(debugObject), lastError))
+    if (!QueryInfoAllowStatus(
+            ::GetCurrentProcess(),
+            ProcessDebugObjectHandle,
+            &debugObject,
+            sizeof(debugObject),
+            kNtStatusPortNotSet,
+            lastError))
     {
         return AD_FAILED;
     }
 
-    return debugObject != nullptr ? AD_DETECTED : AD_NOT_DETECTED;
+    if (debugObject == nullptr)
+    {
+        return AD_NOT_DETECTED;
+    }
+
+    CloseDebugObjectHandle(debugObject);
+    return AD_DETECTED;
 }
 
 DetectionStatus DetectDebugFlags(DWORD* lastError)
@@ -739,12 +877,13 @@ DetectionStatus DetectNtCloseInvalidHandle(DWORD* lastError)
     {
         close(invalidHandle);
     }
-    __except (GetExceptionCode() == 0xC0000008L ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+     __except (GetExceptionCode() == static_cast<DWORD>(kNtStatusInvalidHandle) ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
     {
         caught = TRUE;
     }
 
-    // 本地 SEH 捕获到 STATUS_INVALID_HANDLE，说明NtClose 走了"被调试"分支 → 检测到调试器
+    // 正常进程：NtClose 抛出的 kNtStatusInvalidHandle 会被本地 SEH 捕获。
+    // 被调试时：调试器先收到首次异常并吞掉，本地 SEH 通常捕获不到 → 判定为检测到调试器。
     return caught ? AD_DETECTED : AD_NOT_DETECTED;
 }
 
@@ -793,7 +932,13 @@ DetectionStatus DetectDebugObject(DWORD* lastError)
     // 复制伪句柄得到的是 Process 类型，无法命中 DebugObject；
     // 因此改用 ProcessDebugObjectHandle 获取真实调试对象句柄后再确认类型。
     HANDLE debugObjectHandle = nullptr;
-    if (!QueryInfo(::GetCurrentProcess(), ProcessDebugObjectHandle, &debugObjectHandle, sizeof(debugObjectHandle), lastError))
+    if (!QueryInfoAllowStatus(
+            ::GetCurrentProcess(),
+            ProcessDebugObjectHandle,
+            &debugObjectHandle,
+            sizeof(debugObjectHandle),
+            kNtStatusPortNotSet,
+            lastError))
     {
         return AD_FAILED;
     }
@@ -811,6 +956,7 @@ DetectionStatus DetectDebugObject(DWORD* lastError)
         0,
         0,
         DUPLICATE_SAME_ACCESS);
+    CloseDebugObjectHandle(debugObjectHandle);
     if (status != 0 || duplicated == nullptr)
     {
         if (lastError != nullptr)
@@ -832,20 +978,12 @@ DetectionStatus DetectDebugObject(DWORD* lastError)
 
 DetectionStatus DetectWindowDebugger(DWORD* lastError)
 {
-    if (lastError != nullptr)
-    {
-        *lastError = 0;
-    }
+    if (lastError != nullptr) *lastError = 0;
 
-    // 黑名单数组可在此配置。
-    static const wchar_t* const keywords[] =
-    {
-        L"x32dbg",
-        L"x64dbg",
-        L"ida",
-        L"ollydbg",
-        L"windbg",
-        L"Cheat Engine"
+    static const wchar_t* const keywords[] = {
+        L"x32dbg", L"x64dbg",
+        L"ida pro", L"ida free", L"ida64", L"ida32",
+        L"ollydbg", L"windbg", L"cheat engine", L"dnspy"
     };
 
     WindowSearchContext ctx = {};
@@ -853,17 +991,16 @@ DetectionStatus DetectWindowDebugger(DWORD* lastError)
     ctx.keywordCount = static_cast<int>(_countof(keywords));
     ctx.found = FALSE;
 
-    BOOL ok = ::EnumWindows(DebuggerWindowEnumProc, reinterpret_cast<LPARAM>(&ctx));
-    if (!ok && !ctx.found)
+    ::EnumWindows(DebuggerWindowEnumProc, reinterpret_cast<LPARAM>(&ctx));
+
+    // 类名信号补充（OllyDbg 默认类名，对 UIPI 不敏感）
+    if (!ctx.found && ::FindWindowW(L"10001100", nullptr) != nullptr)
     {
-        DWORD err = ::GetLastError();
-        if (lastError != nullptr)
-        {
-            *lastError = (err != 0) ? err : ERROR_GEN_FAILURE;
-        }
-        return AD_FAILED;
+        ctx.found = TRUE;
     }
 
+    // EnumWindows 返回 FALSE 且非提前终止才算失败；
+    // 该场景 GetLastError 不可靠，仅做兜底，不写具体错误码
     return ctx.found ? AD_DETECTED : AD_NOT_DETECTED;
 }
 
@@ -891,18 +1028,23 @@ DetectionStatus DetectCodeCRC32(DWORD* lastError)
     }
 
     DWORD baseline = g_codeCrcBaseline;
-    if (baseline == 0)
+    if (!g_codeCrcReady)
     {
         if (lastError != nullptr)
         {
-            *lastError = ERROR_INVALID_DATA; // 未注入基准值
+            *lastError = ERROR_INVALID_DATA;
         }
         return AD_FAILED;
     }
 
-    DWORD current = ComputeImageTextCrc(lastError);
-    if (lastError != nullptr && *lastError != 0)
+    DWORD currentError = 0;
+    DWORD current = ComputeImageTextCrc(&currentError);
+    if (currentError != 0)
     {
+        if (lastError != nullptr)
+        {
+            *lastError = currentError;
+        }
         return AD_FAILED;
     }
 
@@ -916,10 +1058,8 @@ DetectionStatus DetectDrxContext(DWORD* lastError)
         *lastError = 0;
     }
 
-    CONTEXT ctx = {};
-    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-
-    if (!::GetThreadContext(::GetCurrentThread(), &ctx))
+    HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
     {
         DWORD err = ::GetLastError();
         if (lastError != nullptr)
@@ -929,35 +1069,93 @@ DetectionStatus DetectDrxContext(DWORD* lastError)
         return AD_FAILED;
     }
 
-    bool hardwareBreakpoint =
-        ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0 || ctx.Dr7 != 0;
-    return hardwareBreakpoint ? AD_DETECTED : AD_NOT_DETECTED;
+    const DWORD currentPid = ::GetCurrentProcessId();
+    const DWORD currentTid = ::GetCurrentThreadId();
+    THREADENTRY32 entry = {};
+    entry.dwSize = sizeof(entry);
+
+    DetectionStatus result = AD_NOT_DETECTED;
+    BOOL queried = FALSE;
+
+    if (::Thread32First(snapshot, &entry))
+    {
+        do
+        {
+            if (entry.th32OwnerProcessID != currentPid || entry.th32ThreadID == currentTid)
+            {
+                continue;
+            }
+
+            HANDLE thread = ::OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME, FALSE, entry.th32ThreadID);
+            if (thread == nullptr)
+            {
+                continue;
+            }
+
+            if (::SuspendThread(thread) == static_cast<DWORD>(-1))
+            {
+                ::CloseHandle(thread);
+                continue;
+            }
+
+            CONTEXT ctx = {};
+            ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            BOOL ok = ::GetThreadContext(thread, &ctx);
+            ::ResumeThread(thread);
+            ::CloseHandle(thread);
+
+            if (!ok)
+            {
+                continue;
+            }
+
+            queried = TRUE;
+            if (HasHardwareBreakpoint(&ctx))
+            {
+                result = AD_DETECTED;
+                break;
+            }
+        } while (::Thread32Next(snapshot, &entry));
+    }
+
+    ::CloseHandle(snapshot);
+
+    if (result == AD_DETECTED)
+    {
+        return AD_DETECTED;
+    }
+
+    if (!queried)
+    {
+        if (lastError != nullptr)
+        {
+            *lastError = ERROR_NOT_FOUND;
+        }
+        return AD_FAILED;
+    }
+
+    return AD_NOT_DETECTED;
 }
 
 DetectionStatus DetectDrxVEH(DWORD* lastError)
 {
-    if (lastError != nullptr)
-    {
-        *lastError = 0;
-    }
+    if (lastError != nullptr) *lastError = 0;
 
+    g_vehDrDetected = FALSE;
     PVOID handler = ::AddVectoredExceptionHandler(1, DrVectoredHandler);
     if (handler == nullptr)
     {
-        DWORD err = ::GetLastError();
-        if (lastError != nullptr)
-        {
-            *lastError = (err != 0) ? err : ERROR_GEN_FAILURE;
-        }
+        // ⑥ AddVectoredExceptionHandler 失败时 GetLastError 不可靠，仅兜底
+        if (lastError != nullptr) *lastError = ERROR_GEN_FAILURE;
         return AD_FAILED;
     }
 
-    g_vehDrDetected = FALSE;
-    ::RaiseException(0x20474343UL, 0, 0, nullptr);
+    ::RaiseException(kCustomCode, 0, 0, nullptr);  // 同步：返回前回调已执行
     ::RemoveVectoredExceptionHandler(handler);
 
     return g_vehDrDetected ? AD_DETECTED : AD_NOT_DETECTED;
 }
+
 
 static const char* const kNtdllHookTargets[] = {
     "NtQueryInformationProcess",
@@ -1076,7 +1274,7 @@ DetectionStatus DetectScyllaHide(DWORD* lastError)
     if (peb == nullptr)
     {
         if (lastError != nullptr) *lastError = ERROR_INVALID_ADDRESS;
-        return AD_NOT_DETECTED;
+        return AD_FAILED;
     }
 
 #ifdef _WIN64
@@ -1093,7 +1291,7 @@ DetectionStatus DetectScyllaHide(DWORD* lastError)
     if (ntdll == nullptr)
     {
         if (lastError != nullptr) *lastError = ERROR_MOD_NOT_FOUND;
-        return AD_NOT_DETECTED;
+        return AD_FAILED;
     }
 
     BYTE mem[16]{};
@@ -1136,6 +1334,15 @@ DetectionStatus DetectBenignPath(DWORD* lastError)
         return AD_FAILED;
     }
 
+    if (g_benignPath[0] == L'\0')
+    {
+        if (lastError != nullptr)
+        {
+            *lastError = ERROR_INVALID_DATA;
+        }
+        return AD_FAILED;
+    }
+
     return StartsWithIgnoreCase(modulePath, g_benignPath) ? AD_NOT_DETECTED : AD_DETECTED;
 }
 
@@ -1168,7 +1375,7 @@ DetectionStatus DetectKernelDebugger(DWORD* lastError)
         return AD_FAILED;
     }
 
-    return info.KdDebuggerEnabled ? AD_DETECTED : AD_NOT_DETECTED;
+    return (info.KdDebuggerEnabled && !info.KdDebuggerNotPresent) ? AD_DETECTED : AD_NOT_DETECTED;
 }
 
 DetectionStatus DetectCheatEngine(DWORD* lastError)
@@ -1234,6 +1441,7 @@ DetectionStatus DetectPCHunter(DWORD* lastError)
 void InitCrcBaseline(DWORD crc)
 {
     g_codeCrcBaseline = crc;
+    g_codeCrcReady = TRUE;
 }
 
 DWORD ComputeCodeCrc32(DWORD* lastError)
@@ -1245,7 +1453,8 @@ void InitBenignPath(const wchar_t* path)
 {
     if (path == nullptr || *path == L'\0')
     {
-        path = L"C:\\";
+        g_benignPath[0] = L'\0';
+        return;
     }
 
     size_t length = ::wcslen(path);
@@ -1256,6 +1465,25 @@ void InitBenignPath(const wchar_t* path)
 
     ::memcpy(g_benignPath, path, length * sizeof(wchar_t));
     g_benignPath[length] = L'\0';
+}
+
+void InitDefaultBenignPath()
+{
+    wchar_t modulePath[MAX_PATH * 2] = {};
+    DWORD length = ::GetModuleFileNameW(nullptr, modulePath, static_cast<DWORD>(_countof(modulePath)));
+    if (length == 0 || length >= _countof(modulePath))
+    {
+        g_benignPath[0] = L'\0';
+        return;
+    }
+
+    wchar_t* slash = ::wcsrchr(modulePath, L'\\');
+    if (slash != nullptr)
+    {
+        slash[1] = L'\0';
+    }
+
+    InitBenignPath(modulePath);
 }
 
 namespace
@@ -1269,20 +1497,20 @@ namespace
         { 5, L"DebugPort", L"NtQueryInformationProcess(ProcessDebugPort=7)，端口非 0 即被调试", &DetectDebugPort },
         { 6, L"DebugObjectHandle", L"NtQueryInformationProcess(ProcessDebugObjectHandle=0x1E)，句柄非空即被调试", &DetectDebugObjectHandle },
         { 7, L"DebugFlags", L"NtQueryInformationProcess(ProcessDebugFlags=0x1F)，被调试时返回 0", &DetectDebugFlags },
-        { 8, L"父进程检测", L"查询父进程名，不在白名单(explorer.exe)即被调试", &DetectParentProcess },
+        { 8, L"父进程检测", L"查询父进程名，不在白名单(explorer/cmd/powershell/WindowsTerminal 等)即被调试", &DetectParentProcess },
         { 9, L"NtClose 无效句柄", L"动态解析 ntdll!NtClose 对 (HANDLE)0x9999 调用，SEH 捕获 STATUS_INVALID_HANDLE", &DetectNtCloseInvalidHandle },
         { 10, L"DebugObject 类型", L"NtDuplicateObject 复制调试对象句柄，NtQueryObject 判断类型名为 DebugObject", &DetectDebugObject },
-        { 11, L"窗口名黑名单", L"EnumWindows+GetWindowTextW，匹配调试器窗口名关键字", &DetectWindowDebugger },
+        { 11, L"窗口名黑名单", L"EnumWindows+GetWindowTextW，匹配调试器窗口名关键字（避免短词误报）", &DetectWindowDebugger },
         { 12, L"TickCount 差值", L"GetTickCount64 前后 Sleep(100)，差值超阈值判定被调试", &DetectTickCountDelta },
         { 13, L".text CRC32", L"解析 PE .text 段计算 CRC32，与 InitCrcBaseline 注入的基准比对", &DetectCodeCRC32 },
-        { 14, L"硬件断点上下文", L"GetThreadContext 读 DR0-DR7（CONTEXT_DEBUG_REGISTERS）", &DetectDrxContext },
+        { 14, L"硬件断点上下文", L"挂起同进程其他线程后 GetThreadContext 读 DR0-DR7", &DetectDrxContext },
         { 15, L"硬件断点 VEH", L"AddVectoredExceptionHandler+RaiseException，回调读 ContextRecord 的 DR", &DetectDrxVEH },
-        { 16, L"ScyllaHide 特征", L"检测 ScyllaHide 相关模块是否加载", &DetectScyllaHide },
-        { 17, L"路径白名单", L"GetModuleFileNameW 与期望路径比对（默认 C:\\）", &DetectBenignPath },
-        { 18, L"内核调试器", L"NtQuerySystemInformation(SystemKernelDebuggerInformation=0x23)", &DetectKernelDebugger },
+        { 16, L"ScyllaHide 特征", L"检测 PEB 伪造版本 1337、Wow64Transition 以及 ntdll 导出的 inline hook", &DetectScyllaHide },
+        { 17, L"路径白名单", L"GetModuleFileNameW 与 InitBenignPath 设置的期望路径前缀比对", &DetectBenignPath },
+        { 18, L"内核调试器", L"NtQuerySystemInformation(SystemKernelDebuggerInformation=0x23)，Enabled 且 Present", &DetectKernelDebugger },
         { 19, L"Cheat Engine 进程", L"Toolhelp32Snapshot 枚举进程名，匹配 cheatengine*", &DetectCheatEngine },
         { 20, L"x64dbg/x32dbg 进程", L"Toolhelp32Snapshot 枚举进程名，匹配 x32dbg.exe/x64dbg.exe", &DetectX64dbg },
-        { 21, L"火绒剑进程", L"Toolhelp32Snapshot 枚举进程名，匹配 HR*/Huorong*", &DetectHuorongSword },
+        { 21, L"火绒剑进程", L"Toolhelp32Snapshot 枚举进程名，匹配 HrSword.exe / HipsMain.exe / Huorong*", &DetectHuorongSword },
         { 22, L"PCHunter 进程", L"Toolhelp32Snapshot 枚举进程名，匹配 PCHunter*", &DetectPCHunter },
     };
 }
