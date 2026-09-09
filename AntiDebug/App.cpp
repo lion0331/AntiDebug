@@ -835,8 +835,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance,
     wc.hCursor = ::LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = ::GetSysColorBrush(COLOR_BTNFACE);
     wc.lpszClassName = kMainWindowClass;
-    wc.hIcon = ::LoadIconW(nullptr, IDI_APPLICATION);
-    wc.hIconSm = ::LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hIcon = ::LoadIconW(nullptr, MAKEINTRESOURCEW(IDI_ICON1));
+    wc.hIconSm = ::LoadIconW(nullptr, MAKEINTRESOURCEW(IDI_ICON1));
 
     if (!::RegisterClassExW(&wc))
     {

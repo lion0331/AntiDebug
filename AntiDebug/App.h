@@ -1,7 +1,7 @@
 ﻿#pragma once
 
 #include <windows.h>
-
+#include "resource.h"
 // UI 行状态数组容量，必须 >= GetDetectionCount()。
 constexpr int kDetectionItemCount = 32;
 
