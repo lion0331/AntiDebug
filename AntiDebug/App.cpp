@@ -40,10 +40,10 @@ namespace
     const int kMargin = 12;
     const int kToolbarY = 8;
     const int kToolbarHeight = 26;
-    const int kListY = 44;
+    const int kListY = 45;
     const int kLogHeight = 250;
     const int kButtonWidth = 88;
-    const int kSummaryWidth = 140;
+    const int kSummaryWidth = 180;
     const int kLegendWidth = 110;
     const int kLegendGap = 4;
 
@@ -248,10 +248,10 @@ namespace
             total = 1;
         }
 
-        int col0 = total * 8 / 100;   // 编号
-        int col1 = total * 22 / 100;  // 检测项
-        int col2 = total * 14 / 100;  // 状态
-        int col3 = total * 12 / 100;  // 错误码
+        int col0 = total * 4 / 100;   // 编号
+        int col1 = total * 18 / 100;  // 检测项
+        int col2 = total * 8 / 100;  // 状态
+        int col3 = total * 10 / 100;  // 错误码
         int col4 = total - col0 - col1 - col2 - col3; // 检测原理
         if (col4 < 80)
         {
